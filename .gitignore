@@ -1,0 +1,94 @@
+# ===========================================
+# nerdymark's Steam Deck Ports - .gitignore
+# ===========================================
+
+# Python virtual environments (auto-created on first run)
+**/venv/
+**/__pycache__/
+*.pyc
+*.pyo
+
+# Download staging directories
+**/downloads/
+
+# ES-DE generated files
+gamelist.xml
+gamelist.backup.xml
+gamelist.copy.xml
+gamelist.Missing.Serial.txt
+metadata.txt
+systeminfo.txt
+
+# Claude Code local config
+.claude/
+
+# ===========================================
+# ES-DE Default Ports (not our creations)
+# ===========================================
+
+# Game data directories (ES-DE defaults)
+alephone/
+cannonball/
+descent1/
+descent2/
+dinothawr/
+doom/
+duke3d/
+easyrpgplayer/
+extract-openbor/
+jumpnbump/
+opentyrian/
+quake/
+quake2/
+quake3/
+wolf3d/
+
+# ES-DE default launcher scripts
+Aleph One Engine*.sh
+Baldurs Gate*.sh
+Bombermaaan.sh
+Cannonball*.sh
+Cave Story.sh
+C-Dogs SDL.sh
+Commander Genius.sh
+Descent*.sh
+Digger Remastered.sh
+Dinothawr.sh
+Doom*.sh
+Duke Nukem*.sh
+EasyRPG*.sh
+Freedoom*.sh
+Icewind Dale*.sh
+Ion Fury.sh
+Jump*.sh
+Kodi.sh
+LinCity-NG.sh
+Micropolis.sh
+Mr.Boom.sh
+MysticMine.sh
+OpenBlok.sh
+OpenBOR*.sh
+OpenTTD.sh
+OpenTyrian.sh
+Pixel Desktop.sh
+Planescape Torment.sh
+Prince of Persia.sh
+Quake*.sh
+Sonic Robo Blast*.sh
+Spear of Destiny.sh
+Splitwolf*.sh
+Steam*.sh
+Super Flappy Birds.sh
+Super Mario War.sh
+SuperTux.sh
+Ur-quan Masters.sh
+VVVVVV.sh
+Wolfenstein*.sh
+XRick.sh
+
+# Test scripts (not for distribution)
+Button Test.sh
+
+# Temporary/log files
+*.log
+*.tmp

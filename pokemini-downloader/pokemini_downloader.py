@@ -149,7 +149,7 @@ class DownloaderUI:
         rom_path = Path(ROM_DIR)
         if rom_path.exists():
             for f in rom_path.iterdir():
-                if f.suffix.lower() in ['.zip', ''.min']:
+                if f.suffix.lower() in ['.zip', '.min']:
                     existing.add(f.stem)
         return existing
 

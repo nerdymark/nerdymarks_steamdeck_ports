@@ -20,6 +20,7 @@ from gloomy_aesthetic import (
     GloomyBackground, draw_nerdymark_brand, draw_title_with_glow, create_panel,
     get_theme, VOID_BLACK, DEEP_GRAY, SMOKE_GRAY, MIST_GRAY, PALE_GRAY, FOG_WHITE
 )
+from git_update import UpdateChecker
 
 BASE_URL = "https://myrient.erista.me/files/No-Intro/SNK%20-%20NeoGeo%20Pocket/"
 ROM_DIR = "/run/media/deck/SK256/Emulation/roms/ngp"
@@ -144,6 +145,10 @@ class DownloaderUI:
         self.background = GloomyBackground(self.width, self.height, accent_color=ACCENT)
         self.clock = pygame.time.Clock()
 
+        # Git update checker
+        self.update_checker = UpdateChecker()
+        self.update_banner_visible = False
+
     def get_existing_games(self):
         existing = set()
         rom_path = Path(ROM_DIR)
@@ -264,6 +269,7 @@ class DownloaderUI:
         controls_surf = self.font_small.render(controls, True, MIST_GRAY)
         self.screen.blit(controls_surf, (self.width//2 - controls_surf.get_width()//2, self.height - 40))
         draw_nerdymark_brand(self.screen, self.font_brand, ACCENT_DIM)
+        self.draw_update_banner()
 
     def draw_keyboard(self):
         overlay = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
@@ -482,6 +488,109 @@ class DownloaderUI:
         self.filter_games()
         return True
 
+    def draw_update_banner(self):
+        """Draw update available notification banner at top of screen"""
+        if not self.update_banner_visible:
+            return
+        banner_height = 30
+        banner_surface = pygame.Surface((self.width, banner_height), pygame.SRCALPHA)
+        pygame.draw.rect(banner_surface, (80, 60, 20, 200), (0, 0, self.width, banner_height))
+        msg = self.update_checker.message
+        if self.update_checker.can_update:
+            msg += " - Press SELECT to update"
+        text_surf = self.font_tiny.render(msg, True, (255, 220, 100))
+        banner_surface.blit(text_surf, (self.width//2 - text_surf.get_width()//2, 6))
+        self.screen.blit(banner_surface, (0, 0))
+
+    def check_for_updates(self):
+        """Check for updates and show dialog if update can be applied"""
+        self.draw_message("Checking for updates...", "Please wait")
+        pygame.display.flip()
+
+        status = self.update_checker.check()
+        if status['update_available']:
+            self.update_banner_visible = True
+            if status['can_update']:
+                return self.offer_update_dialog()
+        return False
+
+    def offer_update_dialog(self):
+        """Show dialog offering to update. Returns True if user chose to update."""
+        selected = 0  # 0 = Update Now, 1 = Skip
+        options = ["Update Now", "Skip"]
+
+        while True:
+            self.background.update()
+            self.background.draw(self.screen)
+            draw_title_with_glow(self.screen, self.font_large, "UPDATE AVAILABLE", ACCENT, self.height//2 - 100)
+
+            msg = f"{self.update_checker._status['behind']} new commits available"
+            msg_surf = self.font_medium.render(msg, True, PALE_GRAY)
+            self.screen.blit(msg_surf, (self.width//2 - msg_surf.get_width()//2, self.height//2 - 40))
+
+            # Draw options
+            for i, opt in enumerate(options):
+                y = self.height//2 + 20 + i * 50
+                color = ACCENT if i == selected else MIST_GRAY
+                opt_surf = self.font_medium.render(f"{'> ' if i == selected else '  '}{opt}", True, color)
+                self.screen.blit(opt_surf, (self.width//2 - opt_surf.get_width()//2, y))
+
+            draw_nerdymark_brand(self.screen, self.font_brand, ACCENT_DIM)
+            pygame.display.flip()
+
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    return False
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_UP:
+                        selected = max(0, selected - 1)
+                    elif event.key == pygame.K_DOWN:
+                        selected = min(len(options) - 1, selected + 1)
+                    elif event.key == pygame.K_RETURN:
+                        if selected == 0:
+                            return self.perform_update()
+                        return False
+                    elif event.key == pygame.K_ESCAPE:
+                        return False
+                if event.type == pygame.JOYBUTTONDOWN:
+                    if event.button == 0:  # A
+                        if selected == 0:
+                            return self.perform_update()
+                        return False
+                    elif event.button == 1:  # B
+                        return False
+
+            # D-pad navigation
+            if self.joystick and self.joystick.get_numhats() > 0:
+                hat = self.joystick.get_hat(0)
+                if hat[1] == 1:
+                    selected = max(0, selected - 1)
+                    pygame.time.wait(150)
+                elif hat[1] == -1:
+                    selected = min(len(options) - 1, selected + 1)
+                    pygame.time.wait(150)
+
+            self.clock.tick(30)
+
+    def perform_update(self):
+        """Perform the git update and show result"""
+        self.draw_message("Updating...", "Pulling latest changes from git")
+        pygame.display.flip()
+
+        success, message = self.update_checker.update()
+
+        if success:
+            self.draw_message("Update Complete!", "Please restart the tool")
+            pygame.display.flip()
+            pygame.time.wait(3000)
+            pygame.quit()
+            sys.exit(0)
+        else:
+            self.draw_message("Update Failed", message[:50])
+            pygame.display.flip()
+            pygame.time.wait(3000)
+            return False
+
     def download_all(self):
         missing_games = [(name, href) for name, href, status in self.filtered_games if not status]
         if not missing_games:
@@ -506,6 +615,10 @@ class DownloaderUI:
 
     def run(self):
         os.makedirs(ROM_DIR, exist_ok=True)
+
+        # Check for updates at startup
+        self.check_for_updates()
+
         self.existing_games = self.get_existing_games()
         self.games = self.fetch_game_list()
 
@@ -555,6 +668,9 @@ class DownloaderUI:
                         self.keyboard_active = True
                         self.key_row = 0
                         self.key_col = 0
+                    elif event.button == 6:  # SELECT button - trigger update if available
+                        if self.update_banner_visible and self.update_checker.can_update:
+                            self.perform_update()
 
             action = self.check_input()
             if action:

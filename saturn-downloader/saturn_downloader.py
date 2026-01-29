@@ -15,6 +15,7 @@ import sys
 import signal
 import atexit
 import time
+import zipfile
 from pathlib import Path
 
 # Add shared module path
@@ -23,9 +24,11 @@ from gloomy_aesthetic import (
     GloomyBackground, draw_nerdymark_brand, draw_title_with_glow, create_panel,
     get_theme, VOID_BLACK, DEEP_GRAY, SMOKE_GRAY, MIST_GRAY, PALE_GRAY, FOG_WHITE
 )
+from git_update import UpdateChecker
 
 BASE_URL = "https://myrient.erista.me/files/Redump/Sega%20-%20Saturn/"
 SATURN_ROM_DIR = "/run/media/deck/SK256/Emulation/roms/saturn"
+CHDMAN_PATH = "/run/media/deck/SK256/Emulation/tools/chdconv/chdman5"
 SOUND_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tada.mp3")
 
 # Disk space thresholds (in GB)
@@ -168,14 +171,20 @@ class SaturnDownloaderUI:
         self.background = GloomyBackground(self.width, self.height, accent_color=ACCENT)
 
         self.clock = pygame.time.Clock()
+        # Git update checker
+        self.update_checker = UpdateChecker()
+        self.update_banner_visible = False
 
     def get_existing_games(self):
-        """Get list of already downloaded games"""
+        """Get list of already downloaded games (checks for CUE files from extracted ZIPs)"""
         existing = set()
         rom_path = Path(SATURN_ROM_DIR)
         if rom_path.exists():
             for f in rom_path.iterdir():
-                if f.suffix.lower() in ['.zip', '.chd', '.cue', '.iso', '.bin']:
+                if f.suffix.lower() == '.cue':
+                    # CUE files: "Game Name (Region).cue" matches "Game Name (Region)" from Myrient
+                    existing.add(f.stem)
+                elif f.suffix.lower() in ['.zip', '.chd', '.iso']:
                     existing.add(f.stem)
         return existing
 
@@ -316,11 +325,12 @@ class SaturnDownloaderUI:
             pygame.draw.rect(self.screen, DEEP_GRAY, (self.width - 30, 160, 10, bar_height), border_radius=5)
             pygame.draw.rect(self.screen, ACCENT_DIM, (self.width - 30, 160 + handle_pos, 10, handle_height), border_radius=5)
 
-        controls = "[D-PAD] Navigate  [A] Download  [X] Download All  [Y] Search  [B] Quit"
+        controls = "[D-PAD] Navigate  [A] Download  [X] Download All  [Y] Search  [L1] Convert to CHD  [B] Quit"
         controls_surf = self.font_small.render(controls, True, MIST_GRAY)
         self.screen.blit(controls_surf, (self.width//2 - controls_surf.get_width()//2, self.height - 40))
 
         draw_nerdymark_brand(self.screen, self.font_brand, ACCENT_DIM)
+        self.draw_update_banner()
 
     def draw_keyboard(self):
         overlay = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
@@ -480,8 +490,151 @@ class SaturnDownloaderUI:
                 if self.selected_index >= self.scroll_offset + self.visible_items:
                     self.scroll_offset = self.selected_index - self.visible_items + 1
 
+    def extract_zip(self, zip_path):
+        """Extract a ZIP file and remove it after successful extraction"""
+        try:
+            with zipfile.ZipFile(zip_path, 'r') as zf:
+                zf.extractall(SATURN_ROM_DIR)
+            os.remove(zip_path)
+            return True
+        except Exception as e:
+            return False
+
+    def get_bin_files_from_cue(self, cue_path):
+        """Parse a CUE file and return list of referenced BIN files"""
+        bin_files = []
+        cue_dir = os.path.dirname(cue_path)
+        try:
+            with open(cue_path, 'r', encoding='utf-8', errors='ignore') as f:
+                for line in f:
+                    line = line.strip()
+                    if line.upper().startswith('FILE'):
+                        # Extract filename between quotes
+                        parts = line.split('"')
+                        if len(parts) >= 2:
+                            bin_name = parts[1]
+                            bin_path = os.path.join(cue_dir, bin_name)
+                            if os.path.exists(bin_path):
+                                bin_files.append(bin_path)
+        except:
+            pass
+        return bin_files
+
+    def convert_to_chd(self, cue_path, update_callback=None):
+        """Convert a CUE/BIN set to CHD format using chdman5"""
+        if not os.path.exists(CHDMAN_PATH):
+            return False, "chdman5 not found"
+
+        chd_path = cue_path.rsplit('.', 1)[0] + '.chd'
+
+        # Get list of BIN files before conversion (to delete after)
+        bin_files = self.get_bin_files_from_cue(cue_path)
+
+        try:
+            proc = subprocess.Popen(
+                [CHDMAN_PATH, 'createcd', '-i', cue_path, '-o', chd_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True
+            )
+            track_process(proc)
+
+            # Monitor conversion progress
+            while proc.poll() is None:
+                # Process pygame events to keep UI responsive
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        proc.kill()
+                        if os.path.exists(chd_path):
+                            os.remove(chd_path)
+                        return False, "Cancelled"
+                    if event.type == pygame.JOYBUTTONDOWN and event.button == 1:
+                        proc.kill()
+                        if os.path.exists(chd_path):
+                            os.remove(chd_path)
+                        return False, "Cancelled"
+
+                if update_callback:
+                    update_callback()
+
+                pygame.time.wait(100)
+
+            if proc.returncode != 0:
+                if os.path.exists(chd_path):
+                    os.remove(chd_path)
+                return False, "Conversion failed"
+
+            # Successfully converted - delete original CUE and BIN files
+            os.remove(cue_path)
+            for bin_file in bin_files:
+                if os.path.exists(bin_file):
+                    os.remove(bin_file)
+
+            return True, chd_path
+
+        except Exception as e:
+            if os.path.exists(chd_path):
+                os.remove(chd_path)
+            return False, str(e)
+
+    def find_unconverted_games(self):
+        """Find CUE files that haven't been converted to CHD yet"""
+        unconverted = []
+        rom_path = Path(SATURN_ROM_DIR)
+        if rom_path.exists():
+            for f in rom_path.iterdir():
+                if f.suffix.lower() == '.cue':
+                    # Check if CHD version already exists
+                    chd_path = f.with_suffix('.chd')
+                    if not chd_path.exists():
+                        unconverted.append(str(f))
+        return sorted(unconverted)
+
+    def convert_all_to_chd(self):
+        """Convert all existing CUE/BIN games to CHD format"""
+        unconverted = self.find_unconverted_games()
+        if not unconverted:
+            self.draw_message("Convert to CHD", "No CUE/BIN games found to convert!")
+            pygame.display.flip()
+            pygame.time.wait(1500)
+            return
+
+        total = len(unconverted)
+        converted = 0
+        failed = 0
+
+        for i, cue_path in enumerate(unconverted):
+            game_name = os.path.basename(cue_path).rsplit('.', 1)[0]
+            self.download_game_name = game_name
+            self.download_progress = int((i / total) * 100)
+            self.download_status = f"Converting to CHD: {i+1}/{total}"
+            self.downloading = True
+
+            def update_ui():
+                self.draw_download_progress()
+                pygame.display.flip()
+
+            update_ui()
+
+            success, result = self.convert_to_chd(cue_path, update_callback=update_ui)
+            if success:
+                converted += 1
+            else:
+                failed += 1
+                if result == "Cancelled":
+                    break
+
+        self.downloading = False
+        self.existing_games = self.get_existing_games()
+        self.filter_games()
+
+        self.draw_message("Convert to CHD", f"Done! Converted: {converted}, Failed: {failed}")
+        pygame.display.flip()
+        self.play_completion_sound()
+        pygame.time.wait(2000)
+
     def download_game(self, game_name, href):
-        """Download a Saturn game - save the ZIP directly"""
+        """Download a Saturn game - download ZIP, extract, and remove ZIP"""
         self.downloading = True
         self.download_game_name = game_name
         self.download_progress = 0
@@ -555,7 +708,43 @@ class SaturnDownloaderUI:
                 self.downloading = False
                 return False
 
+            # Extract the ZIP
             self.download_progress = 100
+            self.download_status = "Extracting..."
+            self.draw_download_progress()
+            pygame.display.flip()
+
+            if not self.extract_zip(dest_path):
+                self.download_status = "Extract failed!"
+                self.draw_download_progress()
+                pygame.display.flip()
+                pygame.time.wait(2000)
+                self.downloading = False
+                return False
+
+            # Find the CUE file that was just extracted and convert to CHD
+            cue_path = os.path.join(SATURN_ROM_DIR, game_name + ".cue")
+            if os.path.exists(cue_path):
+                self.download_status = "Converting to CHD..."
+                self.draw_download_progress()
+                pygame.display.flip()
+
+                def update_ui():
+                    self.draw_download_progress()
+                    pygame.display.flip()
+
+                success, result = self.convert_to_chd(cue_path, update_callback=update_ui)
+                if not success:
+                    self.download_status = f"CHD conversion failed: {result}"
+                    self.draw_download_progress()
+                    pygame.display.flip()
+                    pygame.time.wait(2000)
+                    # Still count as success since we have the extracted files
+                    self.downloading = False
+                    self.existing_games = self.get_existing_games()
+                    self.filter_games()
+                    return True
+
             self.download_status = "Complete!"
             self.draw_download_progress()
             pygame.display.flip()
@@ -573,6 +762,108 @@ class SaturnDownloaderUI:
         self.existing_games = self.get_existing_games()
         self.filter_games()
         return True
+
+    def draw_update_banner(self):
+        """Draw update available notification banner at top of screen"""
+        if not self.update_banner_visible:
+            return
+        banner_height = 30
+        banner_surface = pygame.Surface((self.width, banner_height), pygame.SRCALPHA)
+        pygame.draw.rect(banner_surface, (80, 60, 20, 200), (0, 0, self.width, banner_height))
+        msg = self.update_checker.message
+        if self.update_checker.can_update:
+            msg += " - Press SELECT to update"
+        text_surf = self.font_tiny.render(msg, True, (255, 220, 100))
+        banner_surface.blit(text_surf, (self.width//2 - text_surf.get_width()//2, 6))
+        self.screen.blit(banner_surface, (0, 0))
+
+    def check_for_updates(self):
+        """Check for updates and show dialog if update can be applied"""
+        self.draw_message("Checking for updates...", "Please wait")
+        pygame.display.flip()
+
+        status = self.update_checker.check()
+        if status['update_available']:
+            self.update_banner_visible = True
+            if status['can_update']:
+                return self.offer_update_dialog()
+        return False
+
+    def offer_update_dialog(self):
+        """Show dialog offering to update. Returns True if user chose to update."""
+        selected = 0
+        options = ["Update Now", "Skip"]
+
+        while True:
+            self.background.update()
+            self.background.draw(self.screen)
+            draw_title_with_glow(self.screen, self.font_large, "UPDATE AVAILABLE", ACCENT, self.height//2 - 100)
+
+            msg = f"{self.update_checker._status['behind']} new commits available"
+            msg_surf = self.font_medium.render(msg, True, PALE_GRAY)
+            self.screen.blit(msg_surf, (self.width//2 - msg_surf.get_width()//2, self.height//2 - 40))
+
+            for i, opt in enumerate(options):
+                y = self.height//2 + 20 + i * 50
+                color = ACCENT if i == selected else MIST_GRAY
+                opt_surf = self.font_medium.render(f"{'> ' if i == selected else '  '}{opt}", True, color)
+                self.screen.blit(opt_surf, (self.width//2 - opt_surf.get_width()//2, y))
+
+            draw_nerdymark_brand(self.screen, self.font_brand, ACCENT_DIM)
+            pygame.display.flip()
+
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    return False
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_UP:
+                        selected = max(0, selected - 1)
+                    elif event.key == pygame.K_DOWN:
+                        selected = min(len(options) - 1, selected + 1)
+                    elif event.key == pygame.K_RETURN:
+                        if selected == 0:
+                            return self.perform_update()
+                        return False
+                    elif event.key == pygame.K_ESCAPE:
+                        return False
+                if event.type == pygame.JOYBUTTONDOWN:
+                    if event.button == 0:
+                        if selected == 0:
+                            return self.perform_update()
+                        return False
+                    elif event.button == 1:
+                        return False
+
+            if self.joystick and self.joystick.get_numhats() > 0:
+                hat = self.joystick.get_hat(0)
+                if hat[1] == 1:
+                    selected = max(0, selected - 1)
+                    pygame.time.wait(150)
+                elif hat[1] == -1:
+                    selected = min(len(options) - 1, selected + 1)
+                    pygame.time.wait(150)
+
+            self.clock.tick(30)
+
+    def perform_update(self):
+        """Perform the git update and show result"""
+        self.draw_message("Updating...", "Pulling latest changes from git")
+        pygame.display.flip()
+
+        success, message = self.update_checker.update()
+
+        if success:
+            self.draw_message("Update Complete!", "Please restart the tool")
+            pygame.display.flip()
+            pygame.time.wait(3000)
+            pygame.quit()
+            sys.exit(0)
+        else:
+            self.draw_message("Update Failed", message[:50])
+            pygame.display.flip()
+            pygame.time.wait(3000)
+            return False
+
 
     def download_all(self):
         """Download all missing games from the filtered list"""
@@ -600,6 +891,9 @@ class SaturnDownloaderUI:
 
     def run(self):
         os.makedirs(SATURN_ROM_DIR, exist_ok=True)
+
+        # Check for updates at startup
+        self.check_for_updates()
 
         self.existing_games = self.get_existing_games()
         self.games = self.fetch_game_list()
@@ -652,6 +946,9 @@ class SaturnDownloaderUI:
                         self.keyboard_active = True
                         self.key_row = 0
                         self.key_col = 0
+                    elif event.button == 4:  # L1 button - Convert existing to CHD
+                        if not self.keyboard_active:
+                            self.convert_all_to_chd()
 
             action = self.check_input()
             if action:

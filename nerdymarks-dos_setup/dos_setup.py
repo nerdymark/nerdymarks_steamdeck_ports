@@ -5,8 +5,10 @@ https://nerdymark.com
 
 Helps configure DOSBox-Pure games by:
 - Enumerating DOS game ZIPs
+- Detecting games that need installation (DEICE/LZH installers)
+- Pre-extracting LZH archives for easier setup
 - Previewing executables in each game
-- Launching games for interactive setup (SETUP.EXE)
+- Launching games for interactive setup
 - Creating AUTOBOOT.DBP files for auto-launch
 
 Uses pygame for Steam Deck controller-friendly UI
@@ -17,10 +19,21 @@ import os
 import sys
 import zipfile
 import subprocess
+import shutil
 import logging
+import signal
+import atexit
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from datetime import datetime
+
+# Add shared module path
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'shared'))
+from gloomy_aesthetic import (
+    GloomyBackground, draw_nerdymark_brand, draw_title_with_glow, create_panel,
+    get_theme, VOID_BLACK, DEEP_GRAY, SMOKE_GRAY, MIST_GRAY, PALE_GRAY, FOG_WHITE
+)
+from git_update import UpdateChecker
 
 # Logging setup
 LOG_FILE = "/tmp/dos_setup.log"
@@ -40,28 +53,97 @@ SAVES_DIR = "/run/media/deck/SK256/Emulation/saves/retroarch/saves"
 RETROARCH_CMD = "flatpak run org.libretro.RetroArch"
 DOSBOX_PURE_CORE = "/home/deck/.var/app/org.libretro.RetroArch/config/retroarch/cores/dosbox_pure_libretro.so"
 
+# Theme - DOS gets a retro amber/green theme
+THEME = get_theme('dos')
+ACCENT = THEME['accent']
+ACCENT_DIM = THEME['accent_dim']
+HIGHLIGHT = THEME['highlight']
+
+# Additional colors
+GREEN = (100, 200, 100)
+YELLOW = (255, 220, 100)
+RED = (200, 80, 80)
+BLUE = (100, 150, 255)
+ORANGE = (255, 180, 100)
+PURPLE = (180, 100, 255)
+CYAN = (100, 200, 200)
+
 # Executable patterns
 SETUP_PATTERNS = ['setup', 'install', 'setsound', 'config', 'setblast']
 SKIP_PATTERNS = ['setup.exe', 'install.exe', 'uninstall.exe', 'config.exe', 'readme.exe',
                  'help.exe', 'order.exe', 'register.exe', 'catalog.exe', 'vendor.exe']
 
-# Colors
-BLACK = (0, 0, 0)
-WHITE = (255, 255, 255)
-GREEN = (100, 200, 100)
-DARK_GREEN = (0, 100, 0)
-GRAY = (128, 128, 128)
-DARK_GRAY = (40, 40, 40)
-LIGHT_GRAY = (60, 60, 60)
-YELLOW = (255, 255, 100)
-RED = (255, 100, 100)
-BLUE = (100, 150, 255)
-ORANGE = (255, 180, 100)
-PURPLE = (180, 100, 255)
+# LZH/DEICE installer patterns
+LZH_INSTALLER_FILES = ['deice.exe', 'de-ice.exe', 'ice.exe', 'lha.exe', 'lharc.exe']
+LZH_ARCHIVE_EXTENSIONS = ['.1', '.2', '.3', '.4', '.5', '.6', '.7', '.8', '.9', '.dat', '.lzh', '.lha']
+
+# Process tracking for cleanup
+_child_processes = []
+_cleanup_done = False
+
+
+def cleanup():
+    global _cleanup_done
+    if _cleanup_done:
+        return
+    _cleanup_done = True
+    for proc in _child_processes:
+        try:
+            proc.kill()
+            proc.wait(timeout=2)
+        except:
+            pass
+
+
+def signal_handler(signum, frame):
+    cleanup()
+    pygame.quit()
+    sys.exit(1)
+
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+atexit.register(cleanup)
+
+
+def track_process(proc):
+    _child_processes.append(proc)
+    return proc
+
+
+def check_lha_available() -> bool:
+    """Check if lha/lhasa is available for LZH extraction"""
+    try:
+        result = subprocess.run(['which', 'lha'], capture_output=True, text=True)
+        return result.returncode == 0
+    except:
+        return False
+
+
+def extract_lzh_file(lzh_path: str, dest_dir: str) -> Tuple[bool, str]:
+    """Extract an LZH file using lha command"""
+    try:
+        result = subprocess.run(
+            ['lha', '-xfw=' + dest_dir, lzh_path],
+            capture_output=True,
+            text=True,
+            timeout=120
+        )
+        if result.returncode == 0:
+            return True, "Extraction successful"
+        else:
+            return False, result.stderr or "Unknown error"
+    except subprocess.TimeoutExpired:
+        return False, "Extraction timed out"
+    except FileNotFoundError:
+        return False, "lha command not found - install lhasa package"
+    except Exception as e:
+        return False, str(e)
 
 
 class DOSGame:
     """Represents a DOS game ZIP file"""
+
     def __init__(self, zip_path: Path):
         self.zip_path = zip_path
         self.name = zip_path.stem
@@ -70,24 +152,59 @@ class DOSGame:
         self.game_exes: List[str] = []
         self.autoboot_exe: Optional[str] = None
         self.is_configured = False
-        self._scan_executables()
-        self._check_configured()
-        logger.debug(f"Loaded game: {self.name} - {len(self.executables)} exes, configured={self.is_configured}")
 
-    def _scan_executables(self):
-        """Scan ZIP for executable files"""
+        # LZH installer detection
+        self.has_lzh_installer = False
+        self.lzh_decompressor: Optional[str] = None
+        self.lzh_archives: List[str] = []
+
+        # Save data detection
+        self.has_save_data = False
+        self.save_file_count = 0
+        self.save_size_kb = 0
+
+        self._scan_contents()
+        self._check_configured()
+        self._check_save_data()
+
+        logger.debug(f"Loaded: {self.name} - {len(self.executables)} exes, "
+                     f"lzh={self.has_lzh_installer}, configured={self.is_configured}, "
+                     f"save_data={self.has_save_data}")
+
+    def _scan_contents(self):
+        """Scan ZIP for executable files and LZH installers"""
         try:
             with zipfile.ZipFile(self.zip_path, 'r') as zf:
                 for name in zf.namelist():
                     lower = name.lower()
+                    basename = os.path.basename(name)
+                    basename_lower = basename.lower()
+
+                    # Check for executables
                     if lower.endswith(('.exe', '.bat', '.com')):
-                        basename = os.path.basename(name)
                         if basename:
                             self.executables.append(basename)
                             if any(p in lower for p in SETUP_PATTERNS):
                                 self.setup_exes.append(basename)
-                            elif basename.lower() not in [p.lower() for p in SKIP_PATTERNS]:
+                            elif basename_lower not in [p.lower() for p in SKIP_PATTERNS]:
                                 self.game_exes.append(basename)
+
+                            # Check for LZH decompressor
+                            if basename_lower in LZH_INSTALLER_FILES:
+                                self.has_lzh_installer = True
+                                self.lzh_decompressor = basename
+
+                    # Check for LZH archives
+                    ext = os.path.splitext(lower)[1]
+                    if ext in LZH_ARCHIVE_EXTENSIONS:
+                        self.lzh_archives.append(basename)
+
+                # If we have LZH archives but no decompressor detected, still flag it
+                if self.lzh_archives and not self.has_lzh_installer:
+                    # Check if there's an install.bat that might use deice
+                    if any('install' in e.lower() for e in self.executables):
+                        self.has_lzh_installer = True
+
         except Exception as e:
             logger.error(f"Error scanning {self.zip_path}: {e}")
 
@@ -102,9 +219,22 @@ class DOSGame:
                         if content:
                             self.autoboot_exe = content
                             self.is_configured = True
-                            logger.debug(f"Found autoboot for {self.name}: {content}")
             except Exception as e:
                 logger.error(f"Error checking config for {self.name}: {e}")
+
+    def _check_save_data(self):
+        """Check if game has persistent save data (installed files)"""
+        save_path = Path(SAVES_DIR) / f"{self.name}.pure.zip"
+        if save_path.exists():
+            try:
+                self.save_size_kb = save_path.stat().st_size // 1024
+                with zipfile.ZipFile(save_path, 'r') as zf:
+                    # Count files excluding AUTOBOOT.DBP
+                    files = [n for n in zf.namelist() if n != 'AUTOBOOT.DBP']
+                    self.save_file_count = len(files)
+                    self.has_save_data = self.save_file_count > 0
+            except Exception as e:
+                logger.error(f"Error checking save data for {self.name}: {e}")
 
     def get_likely_game_exe(self) -> Optional[str]:
         """Guess the most likely main game executable"""
@@ -112,12 +242,13 @@ class DOSGame:
             return self.executables[0]
 
         non_setup = [e for e in self.executables
-                     if e.lower() not in [p.lower() for p in SKIP_PATTERNS]]
+                     if e.lower() not in [p.lower() for p in SKIP_PATTERNS]
+                     and e.lower() not in LZH_INSTALLER_FILES]
         if len(non_setup) == 1:
             return non_setup[0]
 
         # Check if game name is in executable name
-        for exe in self.executables:
+        for exe in non_setup or self.executables:
             lower = exe.lower()
             game_words = self.name.lower().split()[0:2]
             for word in game_words:
@@ -128,13 +259,29 @@ class DOSGame:
             return non_setup[0]
         return self.executables[0] if self.executables else None
 
+    def get_install_status(self) -> Tuple[str, Tuple[int, int, int]]:
+        """Get installation status label and color"""
+        if self.is_configured and self.has_save_data:
+            return "[READY]", GREEN
+        elif self.is_configured:
+            return "[CFG]", CYAN
+        elif self.has_save_data:
+            return "[DATA]", BLUE
+        elif self.has_lzh_installer:
+            return "[LZH]", ORANGE
+        elif self.setup_exes:
+            return "[SETUP]", YELLOW
+        elif self.executables:
+            return f"[{len(self.executables)}]", MIST_GRAY
+        else:
+            return "[?]", RED
+
     def set_autoboot(self, exe_name: str) -> bool:
         """Create/update AUTOBOOT.DBP in save file"""
         save_path = Path(SAVES_DIR) / f"{self.name}.pure.zip"
         autoboot_content = f"C:\\{exe_name.upper()}"
 
         logger.info(f"Setting autoboot for {self.name}: {autoboot_content}")
-        logger.info(f"Save path: {save_path}")
 
         try:
             existing_files = {}
@@ -143,7 +290,6 @@ class DOSGame:
                     for name in zf.namelist():
                         if name != 'AUTOBOOT.DBP':
                             existing_files[name] = zf.read(name)
-                logger.debug(f"Preserving {len(existing_files)} existing files in save")
 
             with zipfile.ZipFile(save_path, 'w', zipfile.ZIP_DEFLATED) as zf:
                 zf.writestr('AUTOBOOT.DBP', autoboot_content)
@@ -152,7 +298,6 @@ class DOSGame:
 
             self.autoboot_exe = autoboot_content
             self.is_configured = True
-            logger.info(f"Successfully set autoboot for {self.name}")
             return True
         except Exception as e:
             logger.error(f"Error setting autoboot for {self.name}: {e}")
@@ -161,10 +306,8 @@ class DOSGame:
     def clear_autoboot(self) -> bool:
         """Remove AUTOBOOT.DBP from save file"""
         save_path = Path(SAVES_DIR) / f"{self.name}.pure.zip"
-        logger.info(f"Clearing autoboot for {self.name}")
 
         if not save_path.exists():
-            logger.debug(f"No save file exists for {self.name}")
             self.autoboot_exe = None
             self.is_configured = False
             return True
@@ -180,18 +323,33 @@ class DOSGame:
                 with zipfile.ZipFile(save_path, 'w', zipfile.ZIP_DEFLATED) as zf:
                     for name, data in existing_files.items():
                         zf.writestr(name, data)
-                logger.debug(f"Removed AUTOBOOT.DBP, kept {len(existing_files)} other files")
             else:
                 save_path.unlink()
-                logger.debug(f"Deleted empty save file for {self.name}")
 
             self.autoboot_exe = None
             self.is_configured = False
-            logger.info(f"Successfully cleared autoboot for {self.name}")
             return True
         except Exception as e:
             logger.error(f"Error clearing autoboot for {self.name}: {e}")
             return False
+
+    def clear_save_data(self) -> bool:
+        """Remove all save data for this game"""
+        save_path = Path(SAVES_DIR) / f"{self.name}.pure.zip"
+
+        if save_path.exists():
+            try:
+                save_path.unlink()
+                self.autoboot_exe = None
+                self.is_configured = False
+                self.has_save_data = False
+                self.save_file_count = 0
+                self.save_size_kb = 0
+                return True
+            except Exception as e:
+                logger.error(f"Error clearing save data for {self.name}: {e}")
+                return False
+        return True
 
 
 class DOSSetupUI:
@@ -209,6 +367,7 @@ class DOSSetupUI:
         self.font_medium = pygame.font.Font(None, 36)
         self.font_small = pygame.font.Font(None, 28)
         self.font_tiny = pygame.font.Font(None, 22)
+        self.font_brand = pygame.font.Font(None, 24)
 
         self.joystick = None
         if pygame.joystick.get_count() > 0:
@@ -219,7 +378,7 @@ class DOSSetupUI:
         self.filtered_games: List[DOSGame] = []
         self.selected_index = 0
         self.scroll_offset = 0
-        self.visible_items = (self.height - 250) // 35
+        self.visible_items = (self.height - 280) // 35
 
         self.view_mode = "list"
         self.selected_game: Optional[DOSGame] = None
@@ -244,6 +403,18 @@ class DOSSetupUI:
         self.input_delay = 150
         self.clock = pygame.time.Clock()
 
+        # Gloomy background
+        self.background = GloomyBackground(self.width, self.height, accent_color=ACCENT)
+
+        # Git update checker
+        self.update_checker = UpdateChecker()
+        self.update_banner_visible = False
+
+        # LHA availability
+        self.lha_available = check_lha_available()
+        if not self.lha_available:
+            logger.warning("lha command not found - LZH pre-extraction disabled")
+
     def load_games(self):
         """Load all DOS game ZIPs"""
         self.games = []
@@ -265,7 +436,8 @@ class DOSSetupUI:
                 self.games.append(DOSGame(zip_path))
 
             configured = sum(1 for g in self.games if g.is_configured)
-            logger.info(f"Loaded {len(self.games)} games, {configured} configured")
+            lzh_games = sum(1 for g in self.games if g.has_lzh_installer)
+            logger.info(f"Loaded {len(self.games)} games, {configured} configured, {lzh_games} with LZH installers")
         else:
             logger.warning(f"DOS ROM directory not found: {dos_path}")
 
@@ -283,58 +455,181 @@ class DOSSetupUI:
                 continue
             if self.filter_mode == "needs_setup" and not game.setup_exes:
                 continue
+            if self.filter_mode == "needs_install" and not game.has_lzh_installer:
+                continue
+            if self.filter_mode == "has_data" and not game.has_save_data:
+                continue
             self.filtered_games.append(game)
         self.selected_index = 0
         self.scroll_offset = 0
-        logger.debug(f"Filter applied: mode={self.filter_mode}, search='{self.search_text}', results={len(self.filtered_games)}")
 
     def draw_loading(self, message: str):
-        self.screen.fill(BLACK)
-        title = self.font_large.render("NERDYMARK'S DOS SETUP", True, PURPLE)
-        msg = self.font_medium.render(message, True, WHITE)
-        self.screen.blit(title, (self.width//2 - title.get_width()//2, self.height//2 - 50))
-        self.screen.blit(msg, (self.width//2 - msg.get_width()//2, self.height//2 + 10))
+        self.background.update()
+        self.background.draw(self.screen)
+        draw_title_with_glow(self.screen, self.font_large, "NERDYMARK'S DOS SETUP", ACCENT, self.height // 2 - 50)
+        msg_surf = self.font_medium.render(message, True, PALE_GRAY)
+        self.screen.blit(msg_surf, (self.width // 2 - msg_surf.get_width() // 2, self.height // 2 + 10))
+        draw_nerdymark_brand(self.screen, self.font_brand, ACCENT_DIM)
+
+    def draw_message(self, title: str, message: str):
+        self.background.update()
+        self.background.draw(self.screen)
+        draw_title_with_glow(self.screen, self.font_large, title, ACCENT, self.height // 2 - 50)
+        msg_surf = self.font_medium.render(message, True, PALE_GRAY)
+        self.screen.blit(msg_surf, (self.width // 2 - msg_surf.get_width() // 2, self.height // 2 + 10))
+        draw_nerdymark_brand(self.screen, self.font_brand, ACCENT_DIM)
 
     def draw_status(self):
-        if self.status_message and pygame.time.get_ticks() - self.status_time < 3000:
+        if self.status_message and pygame.time.get_ticks() - self.status_time < 4000:
             surf = self.font_medium.render(self.status_message, True, YELLOW)
-            pygame.draw.rect(self.screen, DARK_GRAY,
-                           (self.width//2 - surf.get_width()//2 - 20, self.height - 90,
-                            surf.get_width() + 40, 40), border_radius=5)
-            self.screen.blit(surf, (self.width//2 - surf.get_width()//2, self.height - 85))
+            panel = create_panel(surf.get_width() + 40, 40, border_color=ACCENT_DIM)
+            self.screen.blit(panel, (self.width // 2 - surf.get_width() // 2 - 20, self.height - 95))
+            self.screen.blit(surf, (self.width // 2 - surf.get_width() // 2, self.height - 90))
 
     def set_status(self, message: str):
         self.status_message = message
         self.status_time = pygame.time.get_ticks()
 
+    def draw_update_banner(self):
+        """Draw update available notification banner at top of screen"""
+        if not self.update_banner_visible:
+            return
+        banner_height = 30
+        banner_surface = pygame.Surface((self.width, banner_height), pygame.SRCALPHA)
+        pygame.draw.rect(banner_surface, (80, 60, 20, 200), (0, 0, self.width, banner_height))
+        msg = self.update_checker.message
+        if self.update_checker.can_update:
+            msg += " - Press SELECT to update"
+        text_surf = self.font_tiny.render(msg, True, (255, 220, 100))
+        banner_surface.blit(text_surf, (self.width // 2 - text_surf.get_width() // 2, 6))
+        self.screen.blit(banner_surface, (0, 0))
+
+    def check_for_updates(self):
+        """Check for updates and show dialog if update can be applied"""
+        self.draw_message("Checking for updates...", "Please wait")
+        pygame.display.flip()
+
+        status = self.update_checker.check()
+        if status['update_available']:
+            self.update_banner_visible = True
+            if status['can_update']:
+                return self.offer_update_dialog()
+        return False
+
+    def offer_update_dialog(self):
+        """Show dialog offering to update."""
+        selected = 0
+        options = ["Update Now", "Skip"]
+
+        while True:
+            self.background.update()
+            self.background.draw(self.screen)
+            draw_title_with_glow(self.screen, self.font_large, "UPDATE AVAILABLE", ACCENT, self.height // 2 - 100)
+
+            msg = f"{self.update_checker._status['behind']} new commits available"
+            msg_surf = self.font_medium.render(msg, True, PALE_GRAY)
+            self.screen.blit(msg_surf, (self.width // 2 - msg_surf.get_width() // 2, self.height // 2 - 40))
+
+            for i, opt in enumerate(options):
+                y = self.height // 2 + 20 + i * 50
+                color = ACCENT if i == selected else MIST_GRAY
+                opt_surf = self.font_medium.render(f"{'> ' if i == selected else '  '}{opt}", True, color)
+                self.screen.blit(opt_surf, (self.width // 2 - opt_surf.get_width() // 2, y))
+
+            draw_nerdymark_brand(self.screen, self.font_brand, ACCENT_DIM)
+            pygame.display.flip()
+
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    return False
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_UP:
+                        selected = max(0, selected - 1)
+                    elif event.key == pygame.K_DOWN:
+                        selected = min(len(options) - 1, selected + 1)
+                    elif event.key == pygame.K_RETURN:
+                        if selected == 0:
+                            return self.perform_update()
+                        return False
+                    elif event.key == pygame.K_ESCAPE:
+                        return False
+                if event.type == pygame.JOYBUTTONDOWN:
+                    if event.button == 0:
+                        if selected == 0:
+                            return self.perform_update()
+                        return False
+                    elif event.button == 1:
+                        return False
+
+            if self.joystick and self.joystick.get_numhats() > 0:
+                hat = self.joystick.get_hat(0)
+                if hat[1] == 1:
+                    selected = max(0, selected - 1)
+                    pygame.time.wait(150)
+                elif hat[1] == -1:
+                    selected = min(len(options) - 1, selected + 1)
+                    pygame.time.wait(150)
+
+            self.clock.tick(30)
+
+    def perform_update(self):
+        """Perform the git update and show result"""
+        self.draw_message("Updating...", "Pulling latest changes from git")
+        pygame.display.flip()
+
+        success, message = self.update_checker.update()
+
+        if success:
+            self.draw_message("Update Complete!", "Please restart the tool")
+            pygame.display.flip()
+            pygame.time.wait(3000)
+            pygame.quit()
+            sys.exit(0)
+        else:
+            self.draw_message("Update Failed", message[:50])
+            pygame.display.flip()
+            pygame.time.wait(3000)
+            return False
+
     def draw_main_list(self):
-        self.screen.fill(BLACK)
+        self.background.update()
+        self.background.draw(self.screen)
 
-        title = self.font_large.render("NERDYMARK'S DOS SETUP", True, PURPLE)
-        self.screen.blit(title, (self.width//2 - title.get_width()//2, 15))
+        draw_title_with_glow(self.screen, self.font_large, "NERDYMARK'S DOS SETUP", ACCENT, 15)
 
+        # Stats
         configured = sum(1 for g in self.games if g.is_configured)
-        stats = f"{len(self.games)} games | {configured} configured | {len(self.filtered_games)} shown"
-        stats_surf = self.font_small.render(stats, True, GRAY)
-        self.screen.blit(stats_surf, (self.width//2 - stats_surf.get_width()//2, 60))
+        lzh_count = sum(1 for g in self.games if g.has_lzh_installer)
+        stats = f"{len(self.games)} games | {configured} configured | {lzh_count} need install | {len(self.filtered_games)} shown"
+        stats_surf = self.font_small.render(stats, True, MIST_GRAY)
+        self.screen.blit(stats_surf, (self.width // 2 - stats_surf.get_width() // 2, 60))
 
+        # Filter indicator
         filter_labels = {
             "all": "ALL",
             "unconfigured": "UNCONFIGURED",
             "configured": "CONFIGURED",
-            "needs_setup": "NEEDS SETUP"
+            "needs_setup": "HAS SETUP.EXE",
+            "needs_install": "NEEDS INSTALL (LZH)",
+            "has_data": "HAS SAVE DATA"
         }
         filter_text = f"Filter: {filter_labels.get(self.filter_mode, self.filter_mode.upper())}"
-        filter_color = YELLOW if self.filter_mode != "all" else GRAY
+        filter_color = YELLOW if self.filter_mode != "all" else MIST_GRAY
         filter_surf = self.font_small.render(filter_text, True, filter_color)
         self.screen.blit(filter_surf, (50, 95))
 
+        # Search box
+        search_panel = create_panel(self.width - 300, 30, border_color=ACCENT_DIM if self.keyboard_active else SMOKE_GRAY)
+        self.screen.blit(search_panel, (250, 90))
         search_label = f"Search: {self.search_text}" + ("_" if not self.keyboard_active else "")
-        search_surf = self.font_small.render(search_label, True, YELLOW if self.search_text else WHITE)
-        pygame.draw.rect(self.screen, DARK_GRAY, (200, 90, self.width - 250, 30))
-        self.screen.blit(search_surf, (210, 95))
+        search_surf = self.font_small.render(search_label, True, HIGHLIGHT if self.search_text else PALE_GRAY)
+        self.screen.blit(search_surf, (260, 95))
 
-        list_top = 130
+        # Game list panel
+        list_panel = create_panel(self.width - 80, self.height - 260, border_color=SMOKE_GRAY)
+        self.screen.blit(list_panel, (40, 130))
+
+        list_top = 138
         for i in range(self.visible_items):
             idx = i + self.scroll_offset
             if idx >= len(self.filtered_games):
@@ -344,144 +639,193 @@ class DOSSetupUI:
             y = list_top + i * 35
 
             if idx == self.selected_index:
-                pygame.draw.rect(self.screen, DARK_GREEN, (50, y, self.width - 100, 33))
+                highlight = pygame.Surface((self.width - 100, 33), pygame.SRCALPHA)
+                pygame.draw.rect(highlight, (*ACCENT_DIM, 120), (0, 0, self.width - 100, 33), border_radius=3)
+                self.screen.blit(highlight, (50, y))
 
-            if game.is_configured:
-                indicator = "[OK]"
-                ind_color = GREEN
-            elif game.setup_exes:
-                # Has setup/install exes - may need configuration
-                indicator = "[CFG]"
-                ind_color = BLUE
-            elif game.executables:
-                indicator = f"[{len(game.executables)}]"
-                ind_color = ORANGE
-            else:
-                indicator = "[?]"
-                ind_color = RED
-
+            # Status indicator
+            indicator, ind_color = game.get_install_status()
             ind_surf = self.font_tiny.render(indicator, True, ind_color)
             self.screen.blit(ind_surf, (60, y + 8))
 
+            # Game name
             name = game.name[:70] + "..." if len(game.name) > 70 else game.name
-            color = WHITE if idx != self.selected_index else GREEN
+            color = HIGHLIGHT if idx == self.selected_index else PALE_GRAY
             name_surf = self.font_small.render(name, True, color)
-            self.screen.blit(name_surf, (120, y + 6))
+            self.screen.blit(name_surf, (130, y + 6))
 
+        # Scrollbar
         if len(self.filtered_games) > self.visible_items:
-            bar_height = self.height - 250
+            bar_height = self.height - 270
             handle_height = max(30, bar_height * self.visible_items // len(self.filtered_games))
             handle_pos = bar_height * self.scroll_offset // max(1, len(self.filtered_games) - self.visible_items)
-            pygame.draw.rect(self.screen, DARK_GRAY, (self.width - 30, 130, 10, bar_height))
-            pygame.draw.rect(self.screen, PURPLE, (self.width - 30, 130 + handle_pos, 10, handle_height))
+            pygame.draw.rect(self.screen, DEEP_GRAY, (self.width - 30, 135, 10, bar_height), border_radius=5)
+            pygame.draw.rect(self.screen, ACCENT_DIM, (self.width - 30, 135 + handle_pos, 10, handle_height), border_radius=5)
 
+        # Legend
+        legend_y = self.height - 120
+        legend_items = [
+            ("[READY]", "Configured + Installed", GREEN),
+            ("[CFG]", "Autoboot Set", CYAN),
+            ("[DATA]", "Has Save Data", BLUE),
+            ("[LZH]", "Needs Install", ORANGE),
+            ("[SETUP]", "Has Setup.exe", YELLOW),
+        ]
+        x = 50
+        for indicator, desc, color in legend_items:
+            ind_surf = self.font_tiny.render(indicator, True, color)
+            self.screen.blit(ind_surf, (x, legend_y))
+            desc_surf = self.font_tiny.render(desc, True, MIST_GRAY)
+            self.screen.blit(desc_surf, (x + ind_surf.get_width() + 5, legend_y))
+            x += ind_surf.get_width() + desc_surf.get_width() + 25
+
+        # Controls
         controls = "[A] Details  [X] Quick Config  [Y] Search  [LB/RB] Filter  [B] Quit"
-        controls_surf = self.font_small.render(controls, True, GRAY)
-        self.screen.blit(controls_surf, (self.width//2 - controls_surf.get_width()//2, self.height - 40))
+        controls_surf = self.font_small.render(controls, True, MIST_GRAY)
+        self.screen.blit(controls_surf, (self.width // 2 - controls_surf.get_width() // 2, self.height - 40))
 
+        draw_nerdymark_brand(self.screen, self.font_brand, ACCENT_DIM)
+        self.draw_update_banner()
         self.draw_status()
 
     def draw_detail_view(self):
         if not self.selected_game:
             return
 
-        self.screen.fill(BLACK)
+        self.background.update()
+        self.background.draw(self.screen)
         game = self.selected_game
 
-        title = self.font_large.render("GAME DETAILS", True, PURPLE)
-        self.screen.blit(title, (self.width//2 - title.get_width()//2, 15))
+        draw_title_with_glow(self.screen, self.font_large, "GAME DETAILS", ACCENT, 15)
 
-        name_surf = self.font_medium.render(game.name[:60], True, WHITE)
+        # Game name
+        name_surf = self.font_medium.render(game.name[:55], True, FOG_WHITE)
         self.screen.blit(name_surf, (50, 70))
 
+        # Status panel
+        status_panel = create_panel(self.width - 100, 80, border_color=SMOKE_GRAY)
+        self.screen.blit(status_panel, (50, 105))
+
+        y = 115
         if game.is_configured:
-            status = f"Configured: {game.autoboot_exe}"
+            status = f"Autoboot: {game.autoboot_exe}"
             status_color = GREEN
         else:
-            status = "Not configured"
+            status = "Not configured - needs autoboot executable set"
             status_color = ORANGE
         status_surf = self.font_small.render(status, True, status_color)
-        self.screen.blit(status_surf, (50, 110))
+        self.screen.blit(status_surf, (60, y))
 
-        exe_title = self.font_medium.render("Executables:", True, YELLOW)
-        self.screen.blit(exe_title, (50, 160))
+        y += 25
+        if game.has_save_data:
+            save_info = f"Save Data: {game.save_file_count} files ({game.save_size_kb} KB) - Game is installed!"
+            save_color = GREEN
+        else:
+            save_info = "No save data - Game may need installation first"
+            save_color = MIST_GRAY
+        save_surf = self.font_small.render(save_info, True, save_color)
+        self.screen.blit(save_surf, (60, y))
 
+        y += 25
+        if game.has_lzh_installer:
+            lzh_info = f"LZH Installer: {game.lzh_decompressor or 'detected'} ({len(game.lzh_archives)} archives)"
+            lzh_surf = self.font_small.render(lzh_info, True, ORANGE)
+            self.screen.blit(lzh_surf, (60, y))
+            y += 25
+
+        # Executables section
         y = 200
+        exe_title = self.font_medium.render("Executables:", True, YELLOW)
+        self.screen.blit(exe_title, (50, y))
+        y += 35
+
         if game.setup_exes:
             setup_label = self.font_small.render("Setup/Install:", True, BLUE)
             self.screen.blit(setup_label, (70, y))
-            y += 25
-            for exe in game.setup_exes[:5]:
-                exe_surf = self.font_small.render(f"  {exe}", True, GRAY)
+            y += 22
+            for exe in game.setup_exes[:4]:
+                exe_surf = self.font_small.render(f"  {exe}", True, MIST_GRAY)
                 self.screen.blit(exe_surf, (70, y))
-                y += 22
-            y += 10
+                y += 20
+            y += 8
 
         if game.game_exes:
             game_label = self.font_small.render("Game:", True, GREEN)
             self.screen.blit(game_label, (70, y))
-            y += 25
-            for exe in game.game_exes[:8]:
-                exe_surf = self.font_small.render(f"  {exe}", True, WHITE)
+            y += 22
+            for exe in game.game_exes[:6]:
+                exe_surf = self.font_small.render(f"  {exe}", True, PALE_GRAY)
                 self.screen.blit(exe_surf, (70, y))
-                y += 22
+                y += 20
 
+        # Suggested executable
         suggested = game.get_likely_game_exe()
         if suggested:
-            y += 20
-            suggest_surf = self.font_small.render(f"Suggested: {suggested}", True, YELLOW)
+            y += 15
+            suggest_surf = self.font_small.render(f"Suggested autoboot: {suggested}", True, YELLOW)
             self.screen.blit(suggest_surf, (50, y))
 
-        # Show potential issues/requirements
-        y += 35
-        issues = []
-        has_install = any('install' in e.lower() for e in game.executables)
-        has_setup = any('setup' in e.lower() or 'setsound' in e.lower() for e in game.executables)
+        # Help text panel
+        help_panel = create_panel(self.width - 100, 130, border_color=SMOKE_GRAY)
+        self.screen.blit(help_panel, (50, self.height - 220))
 
-        if has_install and not game.is_configured:
-            issues.append("May need INSTALL first")
-        if has_setup:
-            issues.append("Has sound SETUP")
+        help_y = self.height - 210
+        help_title = self.font_small.render("DOSBox-Pure Keyboard Tips:", True, CYAN)
+        self.screen.blit(help_title, (60, help_y))
 
-        if issues:
-            issue_surf = self.font_small.render("Notes: " + " | ".join(issues), True, ORANGE)
-            self.screen.blit(issue_surf, (50, y))
-            y += 25
+        help_lines = [
+            "L3 (click left stick) = On-screen keyboard",
+            "Scroll Lock = Game Focus mode (direct keyboard input)",
+            "PAD MAPPER = Bind keys to controller buttons",
+            "SoundBlaster: Port 220, IRQ 7, DMA 1, High DMA 5"
+        ]
+        for i, line in enumerate(help_lines):
+            line_surf = self.font_tiny.render(line, True, MIST_GRAY)
+            self.screen.blit(line_surf, (70, help_y + 25 + i * 20))
 
-        # SoundBlaster help text
-        y += 10
-        sb_help = "SoundBlaster: Port 220, IRQ 7, DMA 1, High DMA 5"
-        sb_surf = self.font_tiny.render(sb_help, True, GRAY)
-        self.screen.blit(sb_surf, (50, y))
-
-        controls = "[A] Set Autoboot  [X] Launch (Setup)  [Y] Launch (Play)  [B] Back"
+        # Controls
         if game.is_configured:
-            controls = "[A] Change  [X] Setup  [Y] Play  [SELECT] Clear  [B] Back"
-        controls_surf = self.font_small.render(controls, True, GRAY)
-        self.screen.blit(controls_surf, (self.width//2 - controls_surf.get_width()//2, self.height - 40))
+            controls = "[A] Change Autoboot  [X] Launch  [Y] Launch  [R1] Clear Data  [B] Back"
+        else:
+            controls = "[A] Set Autoboot  [X] Launch (Setup)  [Y] Launch (Play)  [B] Back"
+        controls_surf = self.font_small.render(controls, True, MIST_GRAY)
+        self.screen.blit(controls_surf, (self.width // 2 - controls_surf.get_width() // 2, self.height - 40))
 
+        draw_nerdymark_brand(self.screen, self.font_brand, ACCENT_DIM)
         self.draw_status()
 
     def draw_exe_select(self):
         if not self.selected_game:
             return
 
-        self.screen.fill(BLACK)
+        self.background.update()
+        self.background.draw(self.screen)
         game = self.selected_game
 
-        title = self.font_large.render("SELECT EXECUTABLE", True, PURPLE)
-        self.screen.blit(title, (self.width//2 - title.get_width()//2, 15))
+        draw_title_with_glow(self.screen, self.font_large, "SELECT EXECUTABLE", ACCENT, 15)
 
-        subtitle = self.font_medium.render(f"For: {game.name[:50]}", True, WHITE)
-        self.screen.blit(subtitle, (self.width//2 - subtitle.get_width()//2, 60))
+        subtitle = self.font_medium.render(f"For: {game.name[:50]}", True, PALE_GRAY)
+        self.screen.blit(subtitle, (self.width // 2 - subtitle.get_width() // 2, 60))
 
-        y = 120
+        # List panel
+        list_panel = create_panel(self.width - 200, self.height - 180, border_color=SMOKE_GRAY)
+        self.screen.blit(list_panel, (100, 100))
+
+        y = 115
         for i, exe in enumerate(game.executables):
+            if y > self.height - 130:
+                break
+
             if i == self.exe_select_index:
-                pygame.draw.rect(self.screen, DARK_GREEN, (100, y, self.width - 200, 35))
+                highlight = pygame.Surface((self.width - 220, 35), pygame.SRCALPHA)
+                pygame.draw.rect(highlight, (*ACCENT_DIM, 120), (0, 0, self.width - 220, 35), border_radius=3)
+                self.screen.blit(highlight, (110, y))
 
             lower = exe.lower()
-            if any(p in lower for p in SETUP_PATTERNS):
+            if lower in LZH_INSTALLER_FILES:
+                prefix = "[LZH]"
+                color = ORANGE
+            elif any(p in lower for p in SETUP_PATTERNS):
                 prefix = "[SETUP]"
                 color = BLUE
             else:
@@ -489,33 +833,34 @@ class DOSSetupUI:
                 color = GREEN
 
             prefix_surf = self.font_small.render(prefix, True, color)
-            self.screen.blit(prefix_surf, (110, y + 6))
+            self.screen.blit(prefix_surf, (120, y + 6))
 
-            exe_color = WHITE if i != self.exe_select_index else GREEN
+            exe_color = HIGHLIGHT if i == self.exe_select_index else PALE_GRAY
             exe_surf = self.font_medium.render(exe, True, exe_color)
-            self.screen.blit(exe_surf, (200, y + 4))
+            self.screen.blit(exe_surf, (210, y + 4))
 
             y += 38
-            if y > self.height - 100:
-                break
 
         controls = "[A] Select  [B] Cancel"
-        controls_surf = self.font_small.render(controls, True, GRAY)
-        self.screen.blit(controls_surf, (self.width//2 - controls_surf.get_width()//2, self.height - 40))
+        controls_surf = self.font_small.render(controls, True, MIST_GRAY)
+        self.screen.blit(controls_surf, (self.width // 2 - controls_surf.get_width() // 2, self.height - 40))
+
+        draw_nerdymark_brand(self.screen, self.font_brand, ACCENT_DIM)
 
     def draw_keyboard(self):
-        overlay = pygame.Surface((self.width, self.height))
-        overlay.set_alpha(200)
-        overlay.fill(BLACK)
+        overlay = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
+        overlay.fill((*VOID_BLACK, 220))
         self.screen.blit(overlay, (0, 0))
 
         kb_width = 600
         kb_height = 300
         kb_x = (self.width - kb_width) // 2
         kb_y = (self.height - kb_height) // 2
-        pygame.draw.rect(self.screen, DARK_GRAY, (kb_x, kb_y, kb_width, kb_height), border_radius=10)
 
-        search_surf = self.font_medium.render(f"Search: {self.search_text}_", True, PURPLE)
+        kb_panel = create_panel(kb_width, kb_height, border_color=ACCENT_DIM)
+        self.screen.blit(kb_panel, (kb_x, kb_y))
+
+        search_surf = self.font_medium.render(f"Search: {self.search_text}_", True, ACCENT)
         self.screen.blit(search_surf, (kb_x + 20, kb_y + 20))
 
         key_size = 50
@@ -532,30 +877,40 @@ class DOSSetupUI:
                     x = start_x + col_idx * 85
 
                 selected = (row_idx == self.key_row and col_idx == self.key_col)
-                color = PURPLE if selected else LIGHT_GRAY
+                color = ACCENT if selected else SMOKE_GRAY
                 pygame.draw.rect(self.screen, color, (x, y, w, key_size), border_radius=5)
 
                 label = " " if key == "SPACE" else key
-                key_surf = self.font_small.render(label, True, BLACK if selected else WHITE)
-                self.screen.blit(key_surf, (x + w//2 - key_surf.get_width()//2,
-                                           y + key_size//2 - key_surf.get_height()//2))
+                key_surf = self.font_small.render(label, True, VOID_BLACK if selected else PALE_GRAY)
+                self.screen.blit(key_surf, (x + w // 2 - key_surf.get_width() // 2,
+                                            y + key_size // 2 - key_surf.get_height() // 2))
 
     def launch_game(self, game: DOSGame):
         """Launch game in DOSBox-Pure via RetroArch"""
+        # Show keyboard tips before launching
+        self.draw_message("LAUNCHING GAME", "L3=On-Screen Keyboard | Scroll Lock=Game Focus")
+        pygame.display.flip()
+        pygame.time.wait(2000)
+
         cmd = f'{RETROARCH_CMD} -L "{DOSBOX_PURE_CORE}" "{game.zip_path}"'
         logger.info(f"Launching game: {game.name}")
         logger.info(f"Command: {cmd}")
+
         try:
             result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
             logger.debug(f"RetroArch exit code: {result.returncode}")
-            if result.stderr:
-                logger.debug(f"RetroArch stderr: {result.stderr[:500]}")
+
+            # Refresh game state
             game._check_configured()
+            game._check_save_data()
+
             if game.is_configured:
                 self.set_status(f"Configured: {game.autoboot_exe}")
-                logger.info(f"Game now configured with: {game.autoboot_exe}")
+            elif game.has_save_data:
+                self.set_status(f"Game has save data ({game.save_file_count} files)")
             else:
-                logger.info(f"Game exited but no autoboot set")
+                self.set_status("Game exited - no changes detected")
+
         except Exception as e:
             logger.error(f"Launch failed for {game.name}: {e}")
             self.set_status(f"Launch failed: {e}")
@@ -668,7 +1023,7 @@ class DOSSetupUI:
                                         self.exe_select_index + 1)
 
     def cycle_filter(self, direction: int):
-        modes = ["all", "unconfigured", "configured", "needs_setup"]
+        modes = ["all", "unconfigured", "configured", "needs_setup", "needs_install", "has_data"]
         idx = modes.index(self.filter_mode)
         idx = (idx + direction) % len(modes)
         self.filter_mode = modes[idx]
@@ -678,6 +1033,9 @@ class DOSSetupUI:
     def run(self):
         os.makedirs(DOS_ROM_DIR, exist_ok=True)
         os.makedirs(SAVES_DIR, exist_ok=True)
+
+        # Check for updates at startup
+        self.check_for_updates()
 
         self.draw_loading("Starting up...")
         pygame.display.flip()
@@ -745,6 +1103,9 @@ class DOSSetupUI:
                             self.cycle_filter(-1)
                         elif event.button == 5:
                             self.cycle_filter(1)
+                        elif event.button == 6:  # SELECT - update
+                            if self.update_banner_visible and self.update_checker.can_update:
+                                self.perform_update()
                     elif self.view_mode == "detail":
                         if event.button == 0 and self.selected_game:
                             self.exe_select_index = 0
@@ -755,9 +1116,11 @@ class DOSSetupUI:
                             self.launch_game(self.selected_game)
                         elif event.button == 3 and self.selected_game:
                             self.launch_game(self.selected_game)
-                        elif event.button == 6 and self.selected_game:
-                            self.selected_game.clear_autoboot()
-                            self.set_status("Autoboot cleared")
+                        elif event.button == 5 and self.selected_game:  # R1 - clear save data
+                            if self.selected_game.clear_save_data():
+                                self.set_status("Save data cleared")
+                            else:
+                                self.set_status("Failed to clear save data")
                     elif self.view_mode == "exe_select":
                         if event.button == 0 and self.selected_game:
                             exe = self.selected_game.executables[self.exe_select_index]
